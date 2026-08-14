@@ -8,12 +8,52 @@ The whole pipeline is one file: `vital_jacket.py`.
 
 ```bash
 pip install -r requirements.txt
-python vital_jacket.py            # download data, train, evaluate, write every report
-python vital_jacket.py --check    # self-checks only
+
+python vital_jacket.py                    # download data, train, evaluate, write reports
+python vital_jacket.py --train            # fit a final model and save it for deployment
+python vital_jacket.py --predict a.wav    # score new recordings with the saved model
+python vital_jacket.py --check            # self-checks only
 ```
 
 Outputs land in `reports/`: validation charts, per-patient review pages, a CSV of every
 recording ranked by score, and a self-contained HTML page with playable audio.
+
+### Scoring a new recording
+
+```
+$ python vital_jacket.py --predict recordings/*.wav
+model: murmur_model.joblib | threshold 0.364 | 2964 recordings, 873 patients
+
+  84693_TV.wav      score 0.999  MURMUR DETECTED  (loudest window 0.999, 9 windows)
+  50164_MV.wav      score 0.028  clear            (loudest window 0.068, 14 windows)
+```
+
+`--predict` needs only the saved model, so a deployed device never touches the dataset.
+The decision threshold is stored inside the model file: a score is meaningless without
+the cut-off it was tuned against, and shipping them separately is how a screener
+silently changes its mind between versions.
+
+Any audio format `libsndfile` reads works, at any sample rate — input is resampled to
+4 kHz internally.
+
+## Pipeline
+
+| Stage | Where |
+|---|---|
+| Dataset download | `fetch_circor()` — 449 MB, idempotent |
+| Labelling | `load_index()` — per auscultation site, patients grouped |
+| Feature extraction | `windows()`, `features()` — 4 s windows, 149 features each |
+| Training + evaluation | `cross_val_scores()` — patient-grouped 5-fold |
+| Deployment model | `train_model()` — final fit, saved with its threshold |
+| Inference | `predict()` — new recordings |
+| Reports | `cohort_chart()`, `patient_chart()`, `render_page()` |
+
+Features are log-mel statistics, MFCCs with deltas, spectral shape descriptors, and five
+hand-built murmur cues (brightness, duty cycle, non-peak brightness, dynamic range, and
+high-frequency energy in the gaps between beats). The cue directions were measured on
+labelled audio rather than assumed, and a self-check re-verifies them. The classifier is
+gradient-boosted trees; deliberately not a CNN, since 489 positive recordings will overfit
+one and this is a baseline to beat.
 
 ## What it detects — and what it does not
 

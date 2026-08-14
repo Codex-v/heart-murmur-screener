@@ -44,6 +44,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+import joblib
 import librosa
 import matplotlib
 import numpy as np
@@ -69,6 +70,7 @@ PASCAL = HEART / "dataset"
 CIRCOR = HEART / "circor"
 CACHE_DIR = HEART / ".cache"
 OUT = ROOT_DIR / "reports"
+MODEL = ROOT_DIR / "murmur_model.joblib"
 
 SR = 4000              # CirCor and PASCAL set_b are native 4 kHz; set_a resamples down
 N_MELS, N_FFT, HOP = 40, 512, 128
@@ -345,6 +347,71 @@ def balanced_threshold(truth, prob):
     describe two different machines."""
     fpr, tpr, thr = roc_curve(truth, prob)
     return float(thr[int(np.argmax(tpr - fpr))])
+
+
+def train_model(df, folds=5, path=MODEL):
+    """Fit on every recording and save the model with its decision threshold.
+
+    Cross-validation measures performance but throws each fold's model away, so
+    it cannot score a new recording. This fits one final model on all the data
+    for deployment. The threshold is carried WITH the model deliberately: a
+    score means nothing without the cut-off it was tuned against, and shipping
+    them separately is how a deployed screener silently changes its mind.
+
+    The reported AUC still comes from cross-validation, never from this fit --
+    a model scored on its own training data would look far better than it is.
+    """
+    X, owner = build_matrix(df)
+    y = (df.label == "murmur").to_numpy().astype(int)
+    _, _, prob = cross_val_scores(df, folds)
+    thr = balanced_threshold(y, prob)
+
+    clf = HistGradientBoostingClassifier(
+        max_iter=400, learning_rate=0.06, max_leaf_nodes=31,
+        l2_regularization=1.0, class_weight="balanced", random_state=0)
+    clf.fit(X, y[owner])
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump({"model": clf, "threshold": thr, "n_features": N_FEATURES, "sr": SR,
+                 "trained_on": f"{len(df)} recordings, {df.patient.nunique()} patients",
+                 "auc_crossval": float(roc_auc_score(y, prob))}, path)
+    print(f"wrote {path}\n  threshold {thr:.3f} | cross-validated AUC "
+          f"{roc_auc_score(y, prob):.3f} · trained on {len(df)} recordings")
+    return path
+
+
+def predict(wav_paths, path=MODEL):
+    """Score new recordings with a saved model. This is the deployment path.
+
+    Prints one line per file. A flag means "this recording contains sounds
+    consistent with a murmur -- refer for an echocardiogram", never a diagnosis.
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"no model at {path}. Train one first:\n  python {Path(__file__).name} --train")
+    bundle = joblib.load(path)
+    clf, thr = bundle["model"], bundle["threshold"]
+    if bundle.get("n_features") != N_FEATURES:
+        raise ValueError(
+            f"model expects {bundle.get('n_features')} features, this code produces "
+            f"{N_FEATURES}. Retrain with --train.")
+
+    print(f"model: {path.name} | threshold {thr:.3f} | {bundle.get('trained_on', '?')}\n")
+    results = []
+    for p in wav_paths:
+        p = Path(p)
+        ws = windows(load_audio(p))
+        scores = clf.predict_proba(np.vstack([features(w) for w in ws]))[:, 1]
+        score = float(scores.mean())          # same fusion the reports use
+        flag = score > thr
+        loudest = float(scores.max())
+        print(f"  {p.name:<34} score {score:.3f}  "
+              f"{'MURMUR DETECTED' if flag else 'clear':<16} "
+              f"(loudest window {loudest:.3f}, {len(ws)} windows)")
+        results.append({"file": str(p), "score": score, "flag": bool(flag)})
+    print("\nA flag means: refer for an echocardiogram. It is not a diagnosis,\n"
+          "and it says nothing about coronary artery disease.")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1181,21 @@ def self_check():
         assert np.sign(got) == want and abs(got) > margin, \
             f"cue '{name}' moved {got:+.3f}, expected sign {want:+d} margin {margin}"
     print("ok  murmur cues separate real murmurs from normals")
+
+    # A saved model and this code must agree on the feature contract. Edit
+    # features() without retraining and every prediction silently shifts, with
+    # no error to notice -- so check the bundle rather than trust it.
+    if MODEL.exists():
+        b = joblib.load(MODEL)
+        assert b["n_features"] == N_FEATURES, (
+            f"{MODEL.name} expects {b['n_features']} features, code produces "
+            f"{N_FEATURES} -- retrain with --train")
+        assert b["sr"] == SR, f"{MODEL.name} trained at {b['sr']} Hz, code uses {SR}"
+        assert 0.0 < b["threshold"] < 1.0, "saved threshold outside (0,1)"
+        assert b["model"].n_features_in_ == N_FEATURES
+        print(f"ok  saved model matches the current feature contract "
+              f"({N_FEATURES} features, {SR} Hz)")
+
     print("all checks passed")
 
 
@@ -1135,14 +1217,27 @@ def main(argv=None):
     ap.add_argument("--skip-audio", action="store_true",
                     help="skip review.html (it is the only stage needing ffmpeg)")
     ap.add_argument("--check", action="store_true", help="run self-checks and exit")
+    ap.add_argument("--train", action="store_true",
+                    help="fit a final model on all data and save it for deployment")
+    ap.add_argument("--predict", nargs="+", metavar="WAV",
+                    help="score new recordings with the saved model, then exit")
     args = ap.parse_args(argv)
 
     sets = tuple(s.strip() for s in args.sets.split(","))
+
+    # Predicting needs no dataset -- only the saved model. Check it first so a
+    # deployed jacket never triggers a 449 MB download.
+    if args.predict:
+        predict(args.predict)
+        return 0
 
     if not args.skip_fetch and "circor" in sets:
         fetch_circor()
     if args.check:
         self_check()
+        return 0
+    if args.train:
+        train_model(load_index(sets=sets), args.folds)
         return 0
 
     df = load_index(sets=sets)
