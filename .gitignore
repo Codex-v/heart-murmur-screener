@@ -1,0 +1,14 @@
+# Allowlist: ignore everything, then permit only the code.
+# The working tree holds ~600 MB of datasets and research documents that must
+# never be committed, so an opt-in list is safer than chasing exclusions.
+/*
+
+!.gitignore
+!README.md
+!requirements.txt
+!vital_jacket.py
+
+# Datasets are downloaded by the script, never vendored:
+#   Heart Sound/circor/   449 MB, PhysioNet, ODC-By
+#   Heart Sound/dataset/  PASCAL challenge wavs
+# Generated output lives in reports/ and is reproducible from a single run.

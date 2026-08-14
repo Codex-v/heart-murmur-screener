@@ -1,0 +1,10 @@
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+scikit-learn>=1.2
+librosa>=0.10
+soundfile>=0.12
+matplotlib>=3.7
+
+# ffmpeg must also be on PATH, but only for the audio review page.
+# Every other output is written without it.
