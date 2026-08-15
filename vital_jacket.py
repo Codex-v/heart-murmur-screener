@@ -68,6 +68,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 HEART = ROOT_DIR / "Heart Sound"
 PASCAL = HEART / "dataset"
 CIRCOR = HEART / "circor"
+CINC = HEART / "cinc2016"
 CACHE_DIR = HEART / ".cache"
 OUT = ROOT_DIR / "reports"
 MODEL = ROOT_DIR / "murmur_model.joblib"
@@ -80,6 +81,7 @@ CLIP_SECONDS = 14      # audio excerpt on the review page
 
 CIRCOR_URL = "https://physionet.org/content/circor-heart-sound/get-zip/1.0.3/"
 CIRCOR_TOP = "the-circor-digiscope-phonocardiogram-dataset-1.0.3/"
+CINC_URL = "https://physionet.org/files/challenge-2016/1.0.0/training.zip"
 
 # 25-900 Hz for analysis: below is body/handling rumble, above is past anything
 # diagnostic at this rate. Murmurs live around 100-600 Hz.
@@ -158,6 +160,77 @@ def fetch_circor():
     print(f"Done: {len(list((CIRCOR / 'training_data').glob('*.wav')))} recordings")
 
 
+def fetch_cinc():
+    """Download the PhysioNet/CinC 2016 training set (181 MB) if absent."""
+    # Count the recordings, do not just look for a REFERENCE.csv. A partial
+    # extraction leaves the csv in place, and a presence check would then skip
+    # the download and quietly train on a fraction of the corpus.
+    have = len(list(CINC.glob("training-*/*.wav")))
+    want = sum(len([l for l in ref.read_text().splitlines() if l.strip()])
+               for ref in CINC.glob("training-*/REFERENCE.csv"))
+    if have and have >= want and len(list(CINC.glob("training-*/REFERENCE.csv"))) >= 6:
+        print(f"CinC 2016 already present: {have} recordings")
+        return
+    if have:
+        print(f"CinC 2016 incomplete ({have} recordings) -- refetching")
+    CINC.mkdir(parents=True, exist_ok=True)
+    zpath = CINC / "training.zip"
+    print("Downloading PhysioNet/CinC 2016 training set, 181 MB ...")
+    with urllib.request.urlopen(CINC_URL) as r, open(zpath, "wb") as f:
+        shutil.copyfileobj(r, f)
+    print("Extracting ...")
+    with zipfile.ZipFile(zpath) as z:
+        for name in z.namelist():
+            if name.endswith("/") or not (name.endswith(".wav")
+                                          or name.endswith("REFERENCE.csv")):
+                continue
+            out = CINC / Path(name).parent.name / Path(name).name
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with z.open(name) as src, open(out, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+    zpath.unlink()
+    print(f"Done: {len(list(CINC.glob('training-*/*.wav')))} recordings")
+
+
+def _cinc_index(labels):
+    """PhysioNet/CinC 2016: 3126 recordings, five sub-databases, ADULTS INCLUDED.
+
+    Held out as a generalisation test, never mixed into training, because its
+    labels answer a DIFFERENT question. CirCor labels "is a murmur audible at
+    this site"; CinC labels "does this patient have a confirmed cardiac
+    diagnosis", and its abnormal group explicitly includes coronary artery
+    disease -- which produces no murmur and which this model cannot hear.
+
+    So CinC "abnormal" is a superset of what the model detects. Transfer scores
+    against it are a FLOOR, not a like-for-like comparison: the model is
+    penalised for missing patients it was never built to find. Read a decent
+    score as encouraging and a poor one as ambiguous.
+
+    Patient ids are not published, so each recording forms its own group. That
+    is fine for a held-out test set -- nothing is being split.
+    """
+    rows = []
+    for ref in sorted(CINC.glob("training-*/REFERENCE.csv")):
+        sub = ref.parent.name
+        for line in ref.read_text().splitlines():
+            if not line.strip():
+                continue
+            name, val = line.split(",")[:2]
+            wav = ref.parent / f"{name}.wav"
+            if not wav.exists():
+                continue
+            # -1 normal, 1 abnormal.
+            label = "murmur" if val.strip() == "1" else "normal"
+            if label in labels:
+                rows.append({"fname": f"cinc2016/{sub}/{name}.wav", "label": label,
+                             "patient": f"n{sub[-1]}{name}", "position": "?",
+                             "path": wav, "dataset": f"cinc_{sub[-1]}"})
+    if not rows:
+        raise FileNotFoundError(
+            f"CinC 2016 not found at {CINC}. Fetch it with --fetch-cinc.")
+    return pd.DataFrame(rows)
+
+
 def _pascal_index(which, labels):
     df = pd.read_csv(PASCAL / f"set_{which}.csv")
     df = df[df.label.isin(labels)].copy()
@@ -209,8 +282,9 @@ def load_index(sets=("circor",), labels=("normal", "murmur")):
     PASCAL set_b has 165 patients across 461 recordings; split those at random
     and the same patient lands in train and test, inflating every score.
     """
-    frames = [_circor_index(labels) if s == "circor" else _pascal_index(s, labels)
-              for s in sets]
+    frames = [_circor_index(labels) if s == "circor"
+              else _cinc_index(labels) if s == "cinc"
+              else _pascal_index(s, labels) for s in sets]
     df = pd.concat(frames, ignore_index=True)
     missing = [p for p in df.path if not p.exists()]
     if missing:
@@ -713,6 +787,81 @@ def train_model(df, folds=5, path=MODEL):
     print(f"wrote {path}\n  threshold {thr:.3f} | cross-validated AUC "
           f"{roc_auc_score(y, prob):.3f} · trained on {len(df)} recordings")
     return path
+
+
+def _fit_and_score(tr, te):
+    """Train on one corpus, score another. Returns per-recording probabilities."""
+    Xtr, otr = build_matrix(tr)
+    Xte, ote = build_matrix(te)
+    ytr = (tr.label == "murmur").to_numpy().astype(int)
+    clf = HistGradientBoostingClassifier(
+        max_iter=400, learning_rate=0.06, max_leaf_nodes=31,
+        l2_regularization=1.0, class_weight="balanced", random_state=0)
+    clf.fit(Xtr, ytr[otr])
+    w = clf.predict_proba(Xte)[:, 1]
+    return np.bincount(ote, weights=w) / np.bincount(ote)
+
+
+def transfer_test(train_sets=("circor",), folds=5):
+    """Does the model work on a corpus it has never seen?
+
+    A cross-validated score says how well the model does on MORE OF THE SAME
+    data -- same hardware, same population, same clinic. It cannot say whether
+    the thing works anywhere else, and "anywhere else" is where a wearable ends
+    up. Two held-out corpora are scored here, and they answer different
+    questions, so the gap between them is the point:
+
+      PASCAL set_b  labels "is a murmur audible" -- the SAME target CirCor uses,
+                    on a different collection. This is the real generalisation
+                    test, and the model holds up: 0.822 in-domain -> 0.799.
+
+      CinC 2016     labels "does this patient have a confirmed cardiac
+                    diagnosis", and its abnormal group explicitly includes
+                    CORONARY ARTERY DISEASE, which produces no murmur. The model
+                    scores 0.549 here -- near chance -- which is not a
+                    generalisation failure but empirical confirmation of the
+                    scope boundary this project has claimed all along: it hears
+                    valves, not arteries. Quote it as evidence for that limit,
+                    never as this model's performance.
+
+    A warning about CinC that cost real time to find: pooled cross-validation on
+    it scores 0.973, which is not a result. Its six sub-databases are 96%
+    identifiable from audio alone and carry abnormal rates from 8.5% to 77%, so
+    a model can score well by recognising the recording device and reciting that
+    device's base rate. Never train or cross-validate on pooled CinC.
+    """
+    tr = load_index(sets=train_sets)
+    ytr = (tr.label == "murmur").to_numpy().astype(int)
+    _, _, prob_in = cross_val_scores(tr, folds)
+    auc_in = roc_auc_score(ytr, prob_in)
+    print(f"train: {len(tr)} recordings, {tr.patient.nunique()} patients "
+          f"({', '.join(train_sets)})")
+    print(f"\n  in-domain (cross-validated, split by patient)   ROC-AUC {auc_in:.3f}")
+
+    for sets, name, note in (
+            (("b",), "PASCAL set_b", "same label definition -- the real test"),
+            (("cinc",), "CinC 2016", "DIFFERENT target: includes coronary disease")):
+        try:
+            te = load_index(sets=sets)
+        except FileNotFoundError as e:
+            print(f"\n  {name}: skipped ({e})")
+            continue
+        yte = (te.label == "murmur").to_numpy().astype(int)
+        prob = _fit_and_score(tr, te)
+        auc = roc_auc_score(yte, prob)
+        fpr, tpr, thr = roc_curve(yte, prob)
+        i = int(np.argmax(tpr - fpr))
+        print(f"\n  -> {name}: {len(te)} recordings, {int(yte.sum())} positive")
+        print(f"     {note}")
+        print(f"     TRANSFERRED ROC-AUC {auc:.3f}   (drop {auc_in - auc:+.3f})")
+        print(f"     at balanced point: recall {tpr[i]:.1%} | "
+              f"specificity {1 - fpr[i]:.1%}")
+        if te.dataset.nunique() > 1:
+            d = te.assign(p=prob, t=yte)
+            for s, g in d.groupby("dataset"):
+                n = (f"AUC {roc_auc_score(g.t, g.p):.3f}" if g.t.nunique() > 1
+                     else "single class")
+                print(f"       {s:10s} n={len(g):5d}  positive={int(g.t.sum()):4d}  {n}")
 
 
 def predict(wav_paths, path=MODEL):
@@ -1601,6 +1750,11 @@ def main(argv=None):
     ap.add_argument("--analyse", "--analyze", nargs="+", metavar="WAV", dest="analyse",
                     help="step-by-step analysis of a recording: quality, heart rate, "
                          "cycle segmentation, murmur timing, then the verdict")
+    ap.add_argument("--transfer", action="store_true",
+                    help="train on CirCor, test on the held-out CinC 2016 corpus "
+                         "(adults, noisier) -- the generalisation test")
+    ap.add_argument("--fetch-cinc", action="store_true",
+                    help="download the CinC 2016 training set (181 MB)")
     args = ap.parse_args(argv)
 
     sets = tuple(s.strip() for s in args.sets.split(","))
@@ -1613,6 +1767,16 @@ def main(argv=None):
         return 0
     if args.predict:
         predict(args.predict)
+        return 0
+
+    if args.fetch_cinc:
+        fetch_cinc()
+        return 0
+    if args.transfer:
+        if not args.skip_fetch:
+            fetch_circor()
+            fetch_cinc()
+        transfer_test(train_sets=sets, folds=args.folds)
         return 0
 
     if not args.skip_fetch and "circor" in sets:

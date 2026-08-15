@@ -13,6 +13,7 @@ python vital_jacket.py                    # download data, train, evaluate, writ
 python vital_jacket.py --train            # fit a final model and save it for deployment
 python vital_jacket.py --analyse a.wav    # step-by-step analysis of one recording
 python vital_jacket.py --predict a.wav    # score new recordings with the saved model
+python vital_jacket.py --transfer         # test on corpora it has never seen
 python vital_jacket.py --check            # self-checks only
 ```
 
@@ -133,11 +134,52 @@ healthy, so always answering "healthy" would already score 79%. Recall and speci
 the numbers worth quoting. The model's raw score is deliberately class-weighted and is
 **not** a calibrated probability; compare it to a threshold, do not read 0.40 as "40%".
 
+## Does it generalise?
+
+```bash
+python vital_jacket.py --transfer     # train on CirCor, score two unseen corpora
+```
+
+A cross-validated score only says how the model does on *more of the same data* — same
+device, same clinic, same population. For a wearable, the number that matters is how it
+does somewhere else.
+
+| Test | Target | ROC-AUC |
+|---|---|---|
+| CirCor, cross-validated | murmur audible at this site | **0.822** |
+| → PASCAL set_b, unseen | murmur audible at this site | **0.799** |
+| → CinC 2016, unseen | any confirmed cardiac diagnosis | 0.549 |
+
+**The model transfers.** Against a corpus it has never seen, scored on the same question
+it was trained to answer, performance drops by 0.023 — 58.9% recall at 92.5% specificity.
+
+**The CinC score is not a generalisation failure.** That corpus labels "does this patient
+have a confirmed cardiac diagnosis", and its abnormal group explicitly includes *coronary
+artery disease*, which produces no murmur. Scoring near chance there is empirical
+confirmation of the scope boundary at the top of this README: it hears valves, not
+arteries. Quote it as evidence for that limit, never as this model's performance.
+
+### A warning about pooled CinC 2016
+
+Cross-validating on pooled CinC gives **ROC-AUC 0.973**. That number is an artifact, and
+anyone reporting a figure of that magnitude on this corpus should check for it.
+
+Its six sub-databases were collected on different equipment and carry very different
+abnormal rates — 8.5% in `training-e`, 77.4% in `training-c`. A classifier can identify
+which sub-database a recording came from **with 96.3% accuracy from the audio alone**, so
+it can score well by recognising the recording device and reciting that device's base
+rate, without ever detecting pathology. Leave-one-database-out across all seven sources
+gives a median AUC of 0.565.
+
+Never train or cross-validate on pooled CinC. It is used here only as a held-out test set.
+
 ## Limitations
 
 - **The training population is paediatric** (664 children, 126 infants, 72 adolescents,
-  6 neonates), so its murmurs are largely innocent or congenital. Performance on adults,
-  whose murmurs are typically degenerative aortic stenosis, is unmeasured.
+  6 neonates), so its murmurs are largely innocent or congenital. The transfer test above
+  uses PASCAL set_b, which is also clinical rather than adult-ambulatory, so performance
+  on adults remains unmeasured — no open corpus pairs adult recordings with per-site
+  murmur labels.
 - **Recordings are clinical, not ambulatory** — captured with a stethoscope held still. A
   body-worn probe will carry far more motion and friction artifact.
 - Most murmurs in the data are faint (grade I–II of VI).
