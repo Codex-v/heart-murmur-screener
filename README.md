@@ -11,6 +11,7 @@ pip install -r requirements.txt
 
 python vital_jacket.py                    # download data, train, evaluate, write reports
 python vital_jacket.py --train            # fit a final model and save it for deployment
+python vital_jacket.py --analyse a.wav    # step-by-step analysis of one recording
 python vital_jacket.py --predict a.wav    # score new recordings with the saved model
 python vital_jacket.py --check            # self-checks only
 ```
@@ -36,12 +37,57 @@ silently changes its mind between versions.
 Any audio format `libsndfile` reads works, at any sample rate — input is resampled to
 4 kHz internally.
 
+### Analysing a recording
+
+`--predict` gives a number. `--analyse` shows the working — signal quality, heart rate,
+cycle segmentation, where the extra sound falls, the acoustic cues, then the verdict:
+
+```
+[2] Signal quality: USABLE
+    beat-to-gap contrast  0.84   (>0.35 good, <0.20 poor)
+    click artifacts       8.9%   (handling noise)
+
+[3] Heart sounds detected: 66
+    heart rate    100 bpm   (cycle 0.60 s)
+
+[4] Cycle segmentation: 32 complete cycles
+    systole  (S1->S2)  0.265 s
+    diastole (S2->S1)  0.327 s
+
+[5] Where the extra sound falls
+    systolic skew  +0.14
+    -> No clear phase preference (healthy hearts skew +0.14 here by default)
+
+[7] Model verdict
+    score  0.999  (threshold 0.364)   VERDICT  MURMUR DETECTED
+```
+
+The S1/S2 detector is measured, not assumed: against the PASCAL challenge's 390
+hand-marked heart sounds it reaches **96.7% recall at 11 ms median timing error**, and
+the self-check re-runs that comparison.
+
+Two deliberate refusals in this output:
+
+- **Timing is withheld when segmentation is unreliable.** If the detected rhythm is
+  irregular or the rate implausible, section 5 prints nothing but the reason. A sentence
+  naming candidate valve lesions, derived from a ten-second "diastole", reads as a
+  clinical finding and is worse than silence. About 1 in 8 recordings is gated off.
+- **Phase timing says *which*, never *whether*.** Calibrated on 108 labelled recordings,
+  gap energy does not separate murmur from normal at all (healthy median 1.13, murmur
+  0.99) — only the systolic-vs-diastolic skew differs, and weakly (+0.14 vs +0.24). So
+  the phase call is reported as conditional on the model's verdict, with both reference
+  values printed.
+
 ## Pipeline
 
 | Stage | Where |
 |---|---|
 | Dataset download | `fetch_circor()` — 449 MB, idempotent |
 | Labelling | `load_index()` — per auscultation site, patients grouped |
+| Beat detection | `shannon_envelope()`, `detect_sounds()` — validated against ground truth |
+| Cycle segmentation | `segment_cycle()` — S1/S2, systole vs diastole |
+| Murmur timing | `murmur_timing()`, gated by `cycles_are_plausible()` |
+| Signal quality | `signal_quality()` — contrast, clicks, clipping |
 | Feature extraction | `windows()`, `features()` — 4 s windows, 149 features each |
 | Training + evaluation | `cross_val_scores()` — patient-grouped 5-fold |
 | Deployment model | `train_model()` — final fit, saved with its threshold |
