@@ -4,8 +4,6 @@ Acoustic screening for heart murmurs from phonocardiogram recordings. Listens to
 chest probe and scores how likely it is to contain a murmur — the turbulent-flow sound a
 narrowed or leaking heart valve makes.
 
-The whole pipeline is one file: `vital_jacket.py`.
-
 ```bash
 pip install -r requirements.txt
 
@@ -26,8 +24,8 @@ recording ranked by score, and a self-contained HTML page with playable audio.
 $ python vital_jacket.py --predict recordings/*.wav
 model: murmur_model.joblib | threshold 0.364 | 2964 recordings, 873 patients
 
-  84693_TV.wav      score 0.999  MURMUR DETECTED  (loudest window 0.999, 9 windows)
-  50164_MV.wav      score 0.028  clear            (loudest window 0.068, 14 windows)
+  84693_TV.wav    100% chance  raw 0.999   MURMUR DETECTED  (9 windows)
+  50164_MV.wav      1% chance  raw 0.028   clear            (14 windows)
 ```
 
 `--predict` needs only the saved model, so a deployed device never touches the dataset.
@@ -60,7 +58,9 @@ cycle segmentation, where the extra sound falls, the acoustic cues, then the ver
     -> No clear phase preference (healthy hearts skew +0.14 here by default)
 
 [7] Model verdict
-    score  0.999  (threshold 0.364)   VERDICT  MURMUR DETECTED
+    raw score    0.999   (threshold 0.364)
+    probability  100%    of a murmur being present
+    VERDICT      MURMUR DETECTED
 ```
 
 The S1/S2 detector is measured, not assumed: against the PASCAL challenge's 390
@@ -79,21 +79,26 @@ Two deliberate refusals in this output:
   the phase call is reported as conditional on the model's verdict, with both reference
   values printed.
 
-## Pipeline
+## Layout
 
-| Stage | Where |
-|---|---|
-| Dataset download | `fetch_circor()` — 449 MB, idempotent |
-| Labelling | `load_index()` — per auscultation site, patients grouped |
-| Beat detection | `shannon_envelope()`, `detect_sounds()` — validated against ground truth |
-| Cycle segmentation | `segment_cycle()` — S1/S2, systole vs diastole |
-| Murmur timing | `murmur_timing()`, gated by `cycles_are_plausible()` |
-| Signal quality | `signal_quality()` — contrast, clicks, clipping |
-| Feature extraction | `windows()`, `features()` — 4 s windows, 149 features each |
-| Training + evaluation | `cross_val_scores()` — patient-grouped 5-fold |
-| Deployment model | `train_model()` — final fit, saved with its threshold |
-| Inference | `predict()` — new recordings |
-| Reports | `cohort_chart()`, `patient_chart()`, `render_page()` |
+`vital_jacket.py` is a thin entry point; the pipeline lives in `vitaljacket/`, one
+module per stage:
+
+| Module | Lines | What it owns |
+|---|---:|---|
+| `config.py` | 61 | Paths, constants, filter coefficients, chart palette |
+| `data.py` | 193 | Dataset download, per-site labelling, audio loading |
+| `features.py` | 87 | 4 s windowing, the 149-number feature vector, caching |
+| `model.py` | 322 | Cross-validation, thresholds, calibration, training, inference |
+| `analysis.py` | 298 | Beat detection, cycle segmentation, murmur timing, signal quality |
+| `report.py` | 66 | Text report and the detections CSV |
+| `charts.py` | 196 | Validation and per-patient review figures |
+| `page.py` | 477 | The playable HTML review page |
+| `checks.py` | 178 | Self-checks for every score-inflating invariant |
+| `cli.py` | 139 | Argument parsing and stage dispatch |
+
+Dependencies run one way: `config` → `data` → `features` → `model` → everything else.
+Nothing imports `cli`.
 
 Features are log-mel statistics, MFCCs with deltas, spectral shape descriptors, and five
 hand-built murmur cues (brightness, duty cycle, non-peak brightness, dynamic range, and
@@ -101,6 +106,40 @@ high-frequency energy in the gaps between beats). The cue directions were measur
 labelled audio rather than assumed, and a self-check re-verifies them. The classifier is
 gradient-boosted trees; deliberately not a CNN, since 489 positive recordings will overfit
 one and this is a baseline to beat.
+
+## Reading the score
+
+The model is trained with `class_weight="balanced"`, which tells it to behave as though
+murmurs were half the population. They are 16.5%. Its raw scores are therefore
+systematically high, so `--train` also fits a calibrator and stores it in the model file:
+
+```
+84693_TV.wav    100% chance  raw 0.999   MURMUR DETECTED
+84826_MV.wav     25% chance  raw 0.394   MURMUR DETECTED
+50164_MV.wav      1% chance  raw 0.028   clear
+```
+
+That middle row is the reason it matters: a raw score just over the threshold is a
+1-in-4 chance, not a near-certainty.
+
+| | ECE | Brier | AUC |
+|---|---|---|---|
+| Raw scores | 0.094 | 0.098 | 0.822 |
+| Platt / sigmoid | **0.028** | 0.087 | **0.821** |
+| Isotonic | 0.014 | 0.086 | 0.811 |
+
+Sigmoid is chosen over the better-calibrated isotonic because isotonic is a step function:
+it collapses distinct scores into ties and costs 0.011 AUC, and AUC is what the screening
+threshold spends. Both are accurate enough that the remaining difference cannot change a
+referral. The calibrator is fitted and evaluated under separate patient-grouped folds —
+fitting and scoring on the same predictions would make any calibrator look perfect.
+
+**The threshold is still applied to the raw score, never the calibrated one.** The
+operating point was tuned on raw scores; re-deriving it from probabilities would move the
+decision. Calibration reprices, it does not re-decide.
+
+**Probabilities carry the training population's prevalence.** They are calibrated against
+a 16.5% murmur rate. Deployed where murmurs are rarer or commoner, they shift accordingly.
 
 ## What it detects — and what it does not
 
@@ -131,8 +170,7 @@ correctly clears **95 of every 100** healthy ones.
 
 Headline accuracy is 87%, but that figure flatters the tool — roughly 79% of patients are
 healthy, so always answering "healthy" would already score 79%. Recall and specificity are
-the numbers worth quoting. The model's raw score is deliberately class-weighted and is
-**not** a calibrated probability; compare it to a threshold, do not read 0.40 as "40%".
+the numbers worth quoting.
 
 ## Does it generalise?
 

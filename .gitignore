@@ -7,6 +7,8 @@
 !README.md
 !requirements.txt
 !vital_jacket.py
+!vitaljacket/
+vitaljacket/__pycache__/
 
 # Datasets are downloaded by the script, never vendored:
 #   Heart Sound/circor/   449 MB, PhysioNet, ODC-By
